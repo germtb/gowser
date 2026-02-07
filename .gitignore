@@ -1,0 +1,27 @@
+# Binary
+gowser
+
+# Claude Code local settings
+.claude/
+
+# Generated Go files from gox transpilation
+*_gox.go
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test output
+*.test
+coverage.out
+
+# Saved markdown files (user output)
+*.md
+!README.md

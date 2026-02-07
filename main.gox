@@ -1,0 +1,2291 @@
+package main
+
+import (
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/germtb/goli"
+	"github.com/germtb/gox"
+
+	"github.com/germtb/gowser/internal/convert"
+	"github.com/germtb/gowser/internal/fetch"
+	"github.com/germtb/gowser/internal/parser"
+)
+
+// Helper to check if segment is a link
+func isLink(seg parser.Segment) bool {
+	return seg.Type == parser.SegmentLink
+}
+
+// LinkWrapper wraps goli.Link with additional metadata for our browser
+type LinkWrapper struct {
+	*goli.Link
+	text       string
+	url        string
+	onActivate func(string)
+}
+
+// NewLinkWrapper creates a new link using goli's Link primitive
+func NewLinkWrapper(url, text string, onActivate func(string)) *LinkWrapper {
+	// Create link with DisableFocus so we can register the wrapper instead
+	link := goli.NewLink(goli.LinkOptions{
+		URL:          url,
+		DisableFocus: true, // We'll manage focus ourselves
+	})
+
+	wrapper := &LinkWrapper{
+		Link:       link,
+		text:       text,
+		url:        url,
+		onActivate: onActivate,
+	}
+
+	// Register wrapper as the focusable (not the embedded link)
+	goli.Register(wrapper)
+	return wrapper
+}
+
+func (l *LinkWrapper) Text() string {
+	return l.text
+}
+
+// Focusable interface implementation - delegate to embedded Link but add scroll behavior
+func (l *LinkWrapper) Focused() bool {
+	return l.Link.Focused()
+}
+
+func (l *LinkWrapper) SetFocused(f bool) {
+	l.Link.SetFocused(f)
+	if f {
+		scrollLinkIntoView(l)
+	}
+}
+
+func (l *LinkWrapper) Focus() {
+	goli.RequestFocus(l)
+}
+
+func (l *LinkWrapper) Blur() {
+	goli.RequestBlur(l)
+}
+
+func (l *LinkWrapper) Dispose() {
+	goli.Unregister(l)
+}
+
+func (l *LinkWrapper) HandleKey(key string) bool {
+	if !l.Focused() {
+		return false
+	}
+	if key == goli.Enter || key == goli.EnterLF {
+		if l.onActivate != nil && l.url != "" {
+			l.onActivate(l.url)
+		}
+		return true
+	}
+	return false
+}
+
+// OverlayType indicates which overlay is currently shown.
+type OverlayType int
+
+const (
+	OverlayNone OverlayType = iota
+	OverlayFind
+	OverlaySave
+)
+
+// HistoryEntry stores navigation history with scroll/focus state.
+type HistoryEntry struct {
+	URL            string
+	ScrollOffset   int
+	FocusedLinkIdx int // -1 if no link focused
+}
+
+// BrowserState holds the current state of the browser.
+type BrowserState struct {
+	URL            string
+	Title          string
+	RawHTML        string // Store raw HTML for readability toggle
+	UseReadability bool   // Current readability mode
+	Lines          []parser.ParsedLine
+	Links          []*LinkWrapper
+	ScrollOffset   int
+	Loading        bool   // Initial loading (no content yet)
+	Refining       bool   // JS rendering in background (have initial content)
+	Error          string
+	History        []HistoryEntry
+	HistoryIndex   int
+	// Overlay state
+	Overlay      OverlayType
+	OverlayInput string
+	// Search state
+	SearchQuery   string
+	SearchMatches []int // Line indices with matches
+	SearchIndex   int   // Current match index
+	// Status message (temporary)
+	StatusMessage string
+	// Spinner state
+	SpinnerFrame int
+}
+
+var (
+	state, setState = goli.CreateSignal(BrowserState{})
+	app             *goli.App
+	spinnerStop     chan struct{}
+)
+
+// Spinner frames - braille dots animation
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+// startSpinner starts the spinner animation goroutine
+func startSpinner() {
+	if spinnerStop != nil {
+		return // Already running
+	}
+	spinnerStop = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(80 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-spinnerStop:
+				return
+			case <-ticker.C:
+				goli.BatchVoid(func() {
+					s := state()
+					if s.Loading || s.Refining {
+						setState(BrowserState{
+							URL:            s.URL,
+							Title:          s.Title,
+							RawHTML:        s.RawHTML,
+							UseReadability: s.UseReadability,
+							Lines:          s.Lines,
+							Links:          s.Links,
+							ScrollOffset:   s.ScrollOffset,
+							Loading:        s.Loading,
+							Refining:       s.Refining,
+							Error:          s.Error,
+							History:        s.History,
+							HistoryIndex:   s.HistoryIndex,
+							Overlay:        s.Overlay,
+							OverlayInput:   s.OverlayInput,
+							SearchQuery:    s.SearchQuery,
+							SearchMatches:  s.SearchMatches,
+							SearchIndex:    s.SearchIndex,
+							StatusMessage:  s.StatusMessage,
+							SpinnerFrame:   (s.SpinnerFrame + 1) % len(spinnerFrames),
+						})
+					}
+				})
+			}
+		}
+	}()
+}
+
+// stopSpinner stops the spinner animation
+func stopSpinner() {
+	if spinnerStop != nil {
+		close(spinnerStop)
+		spinnerStop = nil
+	}
+}
+
+// disposeLinks unregisters all current links from focus manager.
+func disposeLinks() {
+	s := state()
+	for _, link := range s.Links {
+		link.Dispose()
+	}
+}
+
+// getFocusedLinkIndex returns the index of the currently focused link, or -1.
+func getFocusedLinkIndex() int {
+	s := state()
+	for i, link := range s.Links {
+		if link.Focused() {
+			return i
+		}
+	}
+	return -1
+}
+
+// saveCurrentState updates the current history entry with scroll/focus state.
+func saveCurrentState() {
+	s := state()
+	if len(s.History) == 0 || s.HistoryIndex < 0 || s.HistoryIndex >= len(s.History) {
+		return
+	}
+
+	// Update current history entry
+	newHistory := make([]HistoryEntry, len(s.History))
+	copy(newHistory, s.History)
+	newHistory[s.HistoryIndex] = HistoryEntry{
+		URL:            s.History[s.HistoryIndex].URL,
+		ScrollOffset:   s.ScrollOffset,
+		FocusedLinkIdx: getFocusedLinkIndex(),
+	}
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   s.ScrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        newHistory,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        s.Overlay,
+		OverlayInput:   s.OverlayInput,
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    s.SearchIndex,
+		StatusMessage:  s.StatusMessage,
+	})
+}
+
+// scrollLinkIntoView scrolls the viewport ONLY if the link is outside the visible area.
+func scrollLinkIntoView(link *LinkWrapper) {
+	s := state()
+
+	// Find which line this link is on (skip empty links)
+	linkLine := -1
+	linkCount := 0
+	for i, line := range s.Lines {
+		for _, seg := range line.Segments {
+			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+				if linkCount < len(s.Links) && s.Links[linkCount] == link {
+					linkLine = i
+					break
+				}
+				linkCount++
+			}
+		}
+		if linkLine >= 0 {
+			break
+		}
+	}
+
+	if linkLine < 0 {
+		return
+	}
+
+	// Get viewport height
+	_, height, _ := goli.GetSize(goli.Stdout())
+	if height == 0 {
+		height = 24
+	}
+	contentHeight := height - 5 // title bar (3 lines) + hints + status bar
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	// Calculate visible range
+	visibleStart := s.ScrollOffset
+	visibleEnd := visibleStart + contentHeight
+
+	// If link is within visible range, DO NOTHING
+	if linkLine >= visibleStart && linkLine < visibleEnd {
+		return
+	}
+
+	// Link is out of view - calculate minimum scroll to bring it in
+	var newOffset int
+	if linkLine < visibleStart {
+		// Link is above: scroll so link is at top
+		newOffset = linkLine
+	} else {
+		// Link is below: scroll so link is at bottom
+		newOffset = linkLine - contentHeight + 1
+	}
+
+	// Clamp
+	maxOffset := len(s.Lines) - contentHeight
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if newOffset < 0 {
+		newOffset = 0
+	}
+	if newOffset > maxOffset {
+		newOffset = maxOffset
+	}
+
+	// Final check: don't update if nothing changed
+	if newOffset == s.ScrollOffset {
+		return
+	}
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   newOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        s.Overlay,
+		OverlayInput:   s.OverlayInput,
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    s.SearchIndex,
+		StatusMessage:  s.StatusMessage,
+	})
+}
+
+// navigate fetches and displays a new URL.
+// In JS mode, uses two-phase rendering: quick HTTP first, then rod refines.
+func navigate(targetURL string, addToHistory bool) {
+	// Resolve redirect URLs (e.g., DuckDuckGo redirects)
+	targetURL = fetch.ResolveRedirectURL(targetURL)
+
+	s := state()
+
+	// Save current state before navigating
+	if addToHistory && len(s.History) > 0 {
+		saveCurrentState()
+		s = state() // Refresh after save
+	}
+
+	// Dispose old links
+	disposeLinks()
+
+	// Start spinner
+	startSpinner()
+
+	if addToHistory {
+		var newHistory []HistoryEntry
+		if len(s.History) == 0 {
+			newHistory = []HistoryEntry{{URL: targetURL, ScrollOffset: 0, FocusedLinkIdx: -1}}
+		} else {
+			newHistory = append(s.History[:s.HistoryIndex+1], HistoryEntry{URL: targetURL, ScrollOffset: 0, FocusedLinkIdx: -1})
+		}
+		setState(BrowserState{
+			URL:            targetURL,
+			Loading:        true,
+			UseReadability: true, // Default to readability mode
+			History:        newHistory,
+			HistoryIndex:   len(newHistory) - 1,
+		})
+	} else {
+		setState(BrowserState{
+			URL:            targetURL,
+			Loading:        true,
+			UseReadability: s.UseReadability,
+			History:        s.History,
+			HistoryIndex:   s.HistoryIndex,
+		})
+	}
+
+	go func() {
+		// Phase 1: Quick HTTP fetch (always, even in JS mode)
+		var html string
+		var err error
+		if liteMode {
+			html, err = fetch.FetchHTMLLite(targetURL)
+		} else {
+			html, err = fetch.FetchHTML(targetURL)
+		}
+
+		if err != nil {
+			// If HTTP fetch fails and we're in JS mode, try JS-only
+			if jsMode {
+				html, err = fetch.FetchHTMLWithJS(targetURL)
+				if err != nil {
+					goli.BatchVoid(func() {
+						stopSpinner()
+						s := state()
+						setState(BrowserState{
+							URL:            targetURL,
+							Loading:        false,
+							Error:          err.Error(),
+							UseReadability: s.UseReadability,
+							History:        s.History,
+							HistoryIndex:   s.HistoryIndex,
+						})
+					})
+					return
+				}
+			} else {
+				goli.BatchVoid(func() {
+					stopSpinner()
+					s := state()
+					setState(BrowserState{
+						URL:            targetURL,
+						Loading:        false,
+						Error:          err.Error(),
+						UseReadability: s.UseReadability,
+						History:        s.History,
+						HistoryIndex:   s.HistoryIndex,
+					})
+				})
+				return
+			}
+		}
+
+		// Display initial content
+		displayContent(targetURL, html, jsMode)
+
+		// Phase 2: If JS mode, refine with rod in background
+		if jsMode && err == nil {
+			go func() {
+				jsHTML, jsErr := fetch.FetchHTMLWithJS(targetURL)
+				if jsErr == nil && jsHTML != html {
+					// Only update if content changed
+					displayContent(targetURL, jsHTML, false)
+				}
+				// Stop refining indicator
+				goli.BatchVoid(func() {
+					s := state()
+					if s.Refining {
+						setState(BrowserState{
+							URL:            s.URL,
+							Title:          s.Title,
+							RawHTML:        s.RawHTML,
+							UseReadability: s.UseReadability,
+							Lines:          s.Lines,
+							Links:          s.Links,
+							ScrollOffset:   s.ScrollOffset,
+							Loading:        s.Loading,
+							Refining:       false,
+							Error:          s.Error,
+							History:        s.History,
+							HistoryIndex:   s.HistoryIndex,
+							Overlay:        s.Overlay,
+							OverlayInput:   s.OverlayInput,
+							SearchQuery:    s.SearchQuery,
+							SearchMatches:  s.SearchMatches,
+							SearchIndex:    s.SearchIndex,
+							StatusMessage:  s.StatusMessage,
+						})
+					}
+				})
+			}()
+		}
+	}()
+}
+
+// displayContent converts HTML and displays it, optionally setting refining state
+func displayContent(targetURL string, html string, startRefining bool) {
+	currentState := state()
+	useReadability := currentState.UseReadability
+
+	var result convert.Result
+	var err error
+	if useReadability {
+		result, err = convert.ConvertToMarkdown(html, targetURL)
+	} else {
+		result, err = convert.ConvertToMarkdownRaw(html, targetURL)
+	}
+	if err != nil {
+		goli.BatchVoid(func() {
+			stopSpinner()
+			s := state()
+			setState(BrowserState{
+				URL:            targetURL,
+				Loading:        false,
+				Error:          err.Error(),
+				UseReadability: useReadability,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+			})
+		})
+		return
+	}
+
+	lines := parser.ParseMarkdown(result.Markdown)
+
+	// Dispose old links before creating new ones
+	goli.BatchVoid(func() {
+		disposeLinks()
+	})
+
+	// Create links using goli's Link primitive (skip empty links)
+	var links []*LinkWrapper
+	for _, line := range lines {
+		for _, seg := range line.Segments {
+			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+				links = append(links, NewLinkWrapper(seg.URL, seg.Text, navigateWithHistory))
+			}
+		}
+	}
+
+	goli.BatchVoid(func() {
+		if !startRefining {
+			stopSpinner()
+		}
+		s := state()
+
+		// Check for pending restore (from back/forward navigation)
+		scrollOffset := 0
+		focusIdx := 0
+		if pendingRestore != nil {
+			scrollOffset = pendingRestore.ScrollOffset
+			focusIdx = pendingRestore.FocusedLinkIdx
+			pendingRestore = nil
+		}
+
+		// Ensure scroll offset is valid
+		if scrollOffset >= len(lines) {
+			scrollOffset = 0
+		}
+
+		setState(BrowserState{
+			URL:            targetURL,
+			Title:          result.Title,
+			RawHTML:        html,
+			UseReadability: useReadability,
+			Lines:          lines,
+			Links:          links,
+			ScrollOffset:   scrollOffset,
+			Loading:        false,
+			Refining:       startRefining,
+			History:        s.History,
+			HistoryIndex:   s.HistoryIndex,
+		})
+
+		// Focus restored link or first link
+		if focusIdx >= 0 && focusIdx < len(links) {
+			links[focusIdx].Focus()
+		} else if len(links) > 0 {
+			links[0].Focus()
+		}
+	})
+}
+
+// navigate is used as callback - wrap to always add to history
+func navigateWithHistory(targetURL string) {
+	navigate(targetURL, true)
+}
+
+// reload reloads the current page
+func reload() {
+	s := state()
+	if s.URL != "" {
+		navigate(s.URL, false)
+	}
+}
+
+// toggleReadability toggles between readability and raw mode
+func toggleReadability() {
+	s := state()
+	if s.RawHTML == "" || s.Loading {
+		return
+	}
+
+	// Dispose old links
+	disposeLinks()
+
+	newUseReadability := !s.UseReadability
+
+	var result convert.Result
+	var err error
+	if newUseReadability {
+		result, err = convert.ConvertToMarkdown(s.RawHTML, s.URL)
+	} else {
+		result, err = convert.ConvertToMarkdownRaw(s.RawHTML, s.URL)
+	}
+	if err != nil {
+		return
+	}
+
+	lines := parser.ParseMarkdown(result.Markdown)
+
+	// Create links using goli's Link primitive (skip empty links)
+	var links []*LinkWrapper
+	for _, line := range lines {
+		for _, seg := range line.Segments {
+			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+				links = append(links, NewLinkWrapper(seg.URL, seg.Text, navigateWithHistory))
+			}
+		}
+	}
+
+	modeName := "Reader"
+	if !newUseReadability {
+		modeName = "Raw"
+	}
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          result.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: newUseReadability,
+		Lines:          lines,
+		Links:          links,
+		ScrollOffset:   0,
+		Loading:        false,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		StatusMessage:  modeName + " mode",
+	})
+
+	// Focus first link
+	if len(links) > 0 {
+		links[0].Focus()
+	}
+
+	// Clear status message after delay
+	go func() {
+		time.Sleep(2 * time.Second)
+		goli.BatchVoid(func() {
+			s := state()
+			if s.StatusMessage == modeName+" mode" {
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					Overlay:        s.Overlay,
+					OverlayInput:   s.OverlayInput,
+					SearchQuery:    s.SearchQuery,
+					SearchMatches:  s.SearchMatches,
+					SearchIndex:    s.SearchIndex,
+					StatusMessage:  "",
+				})
+			}
+		})
+	}()
+}
+
+// copyToClipboard copies text to the system clipboard
+func copyToClipboard(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	default:
+		return fmt.Errorf("unsupported platform")
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
+}
+
+// copyURL copies the current URL or focused link URL to clipboard
+func copyURL() {
+	s := state()
+
+	// Check if a link is focused
+	urlToCopy := s.URL
+	for _, link := range s.Links {
+		if link.Focused() {
+			urlToCopy = link.URL()
+			break
+		}
+	}
+
+	if err := copyToClipboard(urlToCopy); err != nil {
+		return
+	}
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   s.ScrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        s.Overlay,
+		OverlayInput:   s.OverlayInput,
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    s.SearchIndex,
+		StatusMessage:  "Copied: " + urlToCopy,
+	})
+
+	// Clear status message after delay
+	go func() {
+		time.Sleep(2 * time.Second)
+		goli.BatchVoid(func() {
+			s := state()
+			if strings.HasPrefix(s.StatusMessage, "Copied:") {
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					Overlay:        s.Overlay,
+					OverlayInput:   s.OverlayInput,
+					SearchQuery:    s.SearchQuery,
+					SearchMatches:  s.SearchMatches,
+					SearchIndex:    s.SearchIndex,
+					StatusMessage:  "",
+				})
+			}
+		})
+	}()
+}
+
+// updateSearchResults updates search matches without closing overlay (for live search)
+func updateSearchResults(query string) {
+	s := state()
+
+	if query == "" {
+		setState(BrowserState{
+			URL:            s.URL,
+			Title:          s.Title,
+			RawHTML:        s.RawHTML,
+			UseReadability: s.UseReadability,
+			Lines:          s.Lines,
+			Links:          s.Links,
+			ScrollOffset:   s.ScrollOffset,
+			Loading:        s.Loading,
+			Error:          s.Error,
+			History:        s.History,
+			HistoryIndex:   s.HistoryIndex,
+			Overlay:        s.Overlay,
+			OverlayInput:   query,
+			SearchQuery:    "",
+			SearchMatches:  nil,
+			SearchIndex:    0,
+		})
+		return
+	}
+
+	// Find all lines containing the query (case-insensitive)
+	queryLower := strings.ToLower(query)
+	var matches []int
+	for i, line := range s.Lines {
+		for _, seg := range line.Segments {
+			if strings.Contains(strings.ToLower(seg.Text), queryLower) {
+				matches = append(matches, i)
+				break
+			}
+		}
+	}
+
+	// Scroll to first match if we have any
+	scrollOffset := s.ScrollOffset
+	if len(matches) > 0 {
+		scrollOffset = scrollToLineInView(matches[0], s.ScrollOffset)
+	}
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   scrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        s.Overlay,
+		OverlayInput:   query,
+		SearchQuery:    query,
+		SearchMatches:  matches,
+		SearchIndex:    0,
+	})
+}
+
+// scrollToLineInView returns the scroll offset needed to show a line, or current offset if already visible
+func scrollToLineInView(lineNum int, currentOffset int) int {
+	_, height, _ := goli.GetSize(goli.Stdout())
+	if height == 0 {
+		height = 24
+	}
+	contentHeight := height - 5
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	visibleStart := currentOffset
+	visibleEnd := currentOffset + contentHeight
+
+	// If line is already visible, don't scroll
+	if lineNum >= visibleStart && lineNum < visibleEnd {
+		return currentOffset
+	}
+
+	// Scroll to put line in view (with some context)
+	if lineNum < visibleStart {
+		return lineNum
+	}
+	return lineNum - contentHeight + 1
+}
+
+// findInPage closes the overlay and finalizes search
+func findInPage(query string) {
+	s := state()
+	if query == "" {
+		setState(BrowserState{
+			URL:            s.URL,
+			Title:          s.Title,
+			RawHTML:        s.RawHTML,
+			UseReadability: s.UseReadability,
+			Lines:          s.Lines,
+			Links:          s.Links,
+			ScrollOffset:   s.ScrollOffset,
+			Loading:        s.Loading,
+			Error:          s.Error,
+			History:        s.History,
+			HistoryIndex:   s.HistoryIndex,
+			Overlay:        OverlayNone,
+			OverlayInput:   "",
+			SearchQuery:    "",
+			SearchMatches:  nil,
+			SearchIndex:    0,
+		})
+		focusedLinkBeforeOverlay = nil
+		return
+	}
+
+	// Search results already computed by updateSearchResults
+	// Just close overlay and try to focus link at match
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   s.ScrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        OverlayNone,
+		OverlayInput:   "",
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    s.SearchIndex,
+	})
+
+	// Try to focus link at current match
+	focusLinkAtCurrentMatch()
+	focusedLinkBeforeOverlay = nil
+}
+
+// nextMatch jumps to the next search match
+func nextMatch() {
+	s := state()
+	if len(s.SearchMatches) == 0 {
+		return
+	}
+
+	newIndex := (s.SearchIndex + 1) % len(s.SearchMatches)
+	newScrollOffset := scrollToLineInView(s.SearchMatches[newIndex], s.ScrollOffset)
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   newScrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        s.Overlay,
+		OverlayInput:   s.OverlayInput,
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    newIndex,
+	})
+}
+
+// prevMatch jumps to the previous search match
+func prevMatch() {
+	s := state()
+	if len(s.SearchMatches) == 0 {
+		return
+	}
+
+	newIndex := s.SearchIndex - 1
+	if newIndex < 0 {
+		newIndex = len(s.SearchMatches) - 1
+	}
+	newScrollOffset := scrollToLineInView(s.SearchMatches[newIndex], s.ScrollOffset)
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   newScrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        s.Overlay,
+		OverlayInput:   s.OverlayInput,
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    newIndex,
+	})
+}
+
+// saveToFile saves the current markdown to a file
+func saveToFile(filename string) {
+	s := state()
+	if filename == "" {
+		return
+	}
+
+	// Add .md extension if not present
+	if !strings.HasSuffix(filename, ".md") {
+		filename = filename + ".md"
+	}
+
+	// Build markdown content
+	var content strings.Builder
+	if s.Title != "" {
+		content.WriteString("# ")
+		content.WriteString(s.Title)
+		content.WriteString("\n\n")
+	}
+	content.WriteString("Source: ")
+	content.WriteString(s.URL)
+	content.WriteString("\n\n---\n\n")
+
+	// Reconstruct markdown from lines
+	for _, line := range s.Lines {
+		for _, seg := range line.Segments {
+			if seg.Type == parser.SegmentLink {
+				content.WriteString("[")
+				content.WriteString(seg.Text)
+				content.WriteString("](")
+				content.WriteString(seg.URL)
+				content.WriteString(")")
+			} else {
+				content.WriteString(seg.Text)
+			}
+		}
+		content.WriteString("\n")
+	}
+
+	// Get absolute path
+	absPath, err := filepath.Abs(filename)
+	if err != nil {
+		absPath = filename
+	}
+
+	err = os.WriteFile(filename, []byte(content.String()), 0644)
+
+	var statusMsg string
+	if err != nil {
+		statusMsg = "Error: " + err.Error()
+	} else {
+		statusMsg = "Saved: " + absPath
+	}
+
+	setState(BrowserState{
+		URL:            s.URL,
+		Title:          s.Title,
+		RawHTML:        s.RawHTML,
+		UseReadability: s.UseReadability,
+		Lines:          s.Lines,
+		Links:          s.Links,
+		ScrollOffset:   s.ScrollOffset,
+		Loading:        s.Loading,
+		Error:          s.Error,
+		History:        s.History,
+		HistoryIndex:   s.HistoryIndex,
+		Overlay:        OverlayNone,
+		OverlayInput:   "",
+		SearchQuery:    s.SearchQuery,
+		SearchMatches:  s.SearchMatches,
+		SearchIndex:    s.SearchIndex,
+		StatusMessage:  statusMsg,
+	})
+
+	restoreFocusAfterOverlay()
+
+	// Clear status message after delay
+	go func() {
+		time.Sleep(3 * time.Second)
+		goli.BatchVoid(func() {
+			s := state()
+			if strings.HasPrefix(s.StatusMessage, "Saved:") || strings.HasPrefix(s.StatusMessage, "Error:") {
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					Overlay:        s.Overlay,
+					OverlayInput:   s.OverlayInput,
+					SearchQuery:    s.SearchQuery,
+					SearchMatches:  s.SearchMatches,
+					SearchIndex:    s.SearchIndex,
+					StatusMessage:  "",
+				})
+			}
+		})
+	}()
+}
+
+// Pending restore state (used when navigating back/forward)
+var pendingRestore *HistoryEntry
+
+// Track focused link before overlay opens (to restore when overlay closes)
+var focusedLinkBeforeOverlay *LinkWrapper
+
+// blurAllLinks unfocuses all links (used when opening overlays)
+func blurAllLinks() {
+	s := state()
+	for _, link := range s.Links {
+		if link.Focused() {
+			focusedLinkBeforeOverlay = link
+			link.Blur()
+			break
+		}
+	}
+}
+
+// restoreFocusAfterOverlay restores focus to the link that was focused before overlay
+func restoreFocusAfterOverlay() {
+	if focusedLinkBeforeOverlay != nil {
+		focusedLinkBeforeOverlay.Focus()
+		focusedLinkBeforeOverlay = nil
+	}
+}
+
+// findLinkAtLine finds the first link on a given line and returns its index
+func findLinkAtLine(lineNum int) int {
+	s := state()
+	if lineNum < 0 || lineNum >= len(s.Lines) {
+		return -1
+	}
+
+	// Count links before this line
+	linkIdx := 0
+	for i := 0; i < lineNum; i++ {
+		for _, seg := range s.Lines[i].Segments {
+			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+				linkIdx++
+			}
+		}
+	}
+
+	// Check if this line has a link
+	for _, seg := range s.Lines[lineNum].Segments {
+		if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+			return linkIdx
+		}
+	}
+
+	return -1
+}
+
+// focusLinkAtCurrentMatch focuses the link at the current search match if one exists
+func focusLinkAtCurrentMatch() bool {
+	s := state()
+	if len(s.SearchMatches) == 0 || s.SearchIndex >= len(s.SearchMatches) {
+		return false
+	}
+
+	currentLine := s.SearchMatches[s.SearchIndex]
+	linkIdx := findLinkAtLine(currentLine)
+
+	if linkIdx >= 0 && linkIdx < len(s.Links) {
+		s.Links[linkIdx].Focus()
+		return true
+	}
+
+	return false
+}
+
+// goBack navigates to the previous URL in history.
+func goBack() {
+	s := state()
+	if s.HistoryIndex > 0 {
+		// Save current state first
+		saveCurrentState()
+		s = state()
+
+		newIndex := s.HistoryIndex - 1
+		entry := s.History[newIndex]
+
+		// Store pending restore for after page loads
+		pendingRestore = &HistoryEntry{
+			URL:            entry.URL,
+			ScrollOffset:   entry.ScrollOffset,
+			FocusedLinkIdx: entry.FocusedLinkIdx,
+		}
+
+		setState(BrowserState{
+			URL:          s.URL,
+			Lines:        s.Lines,
+			Links:        s.Links,
+			ScrollOffset: s.ScrollOffset,
+			Loading:      s.Loading,
+			Error:        s.Error,
+			History:      s.History,
+			HistoryIndex: newIndex,
+		})
+		navigate(entry.URL, false)
+	}
+}
+
+// goForward navigates to the next URL in history.
+func goForward() {
+	s := state()
+	if s.HistoryIndex < len(s.History)-1 {
+		// Save current state first
+		saveCurrentState()
+		s = state()
+
+		newIndex := s.HistoryIndex + 1
+		entry := s.History[newIndex]
+
+		// Store pending restore for after page loads
+		pendingRestore = &HistoryEntry{
+			URL:            entry.URL,
+			ScrollOffset:   entry.ScrollOffset,
+			FocusedLinkIdx: entry.FocusedLinkIdx,
+		}
+
+		setState(BrowserState{
+			URL:          s.URL,
+			Lines:        s.Lines,
+			Links:        s.Links,
+			ScrollOffset: s.ScrollOffset,
+			Loading:      s.Loading,
+			Error:        s.Error,
+			History:      s.History,
+			HistoryIndex: newIndex,
+		})
+		navigate(entry.URL, false)
+	}
+}
+
+// getLinkIndex returns the index of a link in the links slice.
+func getLinkIndex(link *LinkWrapper) int {
+	s := state()
+	for i, l := range s.Links {
+		if l == link {
+			return i
+		}
+	}
+	return -1
+}
+
+// LinkViewProps defines props for LinkView component
+type LinkViewProps struct {
+	Link           *LinkWrapper
+	Seg            parser.Segment // The segment with parsed Children
+	SearchQuery    string
+	IsCurrentMatch bool
+}
+
+// renderLinkChildren renders link children with formatting and optional search highlighting
+func renderLinkChildren(children []parser.Segment, query string, isCurrentMatch bool) []gox.VNode {
+	var nodes []gox.VNode
+	baseStyle := map[string]any{"color": "blue", "underline": true}
+
+	for _, child := range children {
+		// Build style based on segment type
+		style := make(map[string]any)
+		for k, v := range baseStyle {
+			style[k] = v
+		}
+
+		switch child.Type {
+		case parser.SegmentBold:
+			style["bold"] = true
+		case parser.SegmentItalic:
+			style["italic"] = true
+		case parser.SegmentCode:
+			style["background"] = "black"
+			style["color"] = "green"
+		}
+
+		// Apply search highlighting
+		if query != "" {
+			nodes = append(nodes, highlightText(child.Text, query, isCurrentMatch, style)...)
+		} else {
+			nodes = append(nodes, <text style={style}>{child.Text}</text>)
+		}
+	}
+
+	if len(nodes) == 0 {
+		return []gox.VNode{<text style={baseStyle}>{""}</text>}
+	}
+
+	return nodes
+}
+
+func LinkView(props LinkViewProps, children ...gox.VNode) gox.VNode {
+	link := props.Link
+	seg := props.Seg
+	query := props.SearchQuery
+	isCurrent := props.IsCurrentMatch
+	focused := link.Focused()
+
+	// If link is focused, show focus style (yellow background)
+	if focused {
+		return <text style={map[string]any{"background": "yellow", "color": "black", "bold": true}}>{link.text}</text>
+	}
+
+	// Use parsed children for proper formatting
+	if len(seg.Children) > 0 {
+		nodes := renderLinkChildren(seg.Children, query, isCurrent)
+		return gox.Element("box", gox.Props{"direction": "row"}, nodes...)
+	}
+
+	// Fallback: render as plain link
+	baseStyle := map[string]any{"color": "blue", "underline": true}
+	if query != "" {
+		nodes := highlightText(link.text, query, isCurrent, baseStyle)
+		return gox.Element("box", gox.Props{"direction": "row"}, nodes...)
+	}
+	return <text style={baseStyle}>{link.text}</text>
+}
+
+// highlightText splits text at search matches and returns nodes with highlighting
+func highlightText(text string, query string, isCurrentMatch bool, baseStyle map[string]any) []gox.VNode {
+	if query == "" || text == "" {
+		if baseStyle != nil && len(baseStyle) > 0 {
+			return []gox.VNode{<text style={baseStyle}>{text}</text>}
+		}
+		return []gox.VNode{<text>{text}</text>}
+	}
+
+	queryLower := strings.ToLower(query)
+	textLower := strings.ToLower(text)
+	var nodes []gox.VNode
+	lastEnd := 0
+
+	for {
+		idx := strings.Index(textLower[lastEnd:], queryLower)
+		if idx == -1 {
+			break
+		}
+		idx += lastEnd
+
+		// Add text before match
+		if idx > lastEnd {
+			before := text[lastEnd:idx]
+			if baseStyle != nil && len(baseStyle) > 0 {
+				nodes = append(nodes, <text style={baseStyle}>{before}</text>)
+			} else {
+				nodes = append(nodes, <text>{before}</text>)
+			}
+		}
+
+		// Add highlighted match - use actual matched text length from original
+		matchEnd := idx + len(query)
+		if matchEnd > len(text) {
+			matchEnd = len(text)
+		}
+		matchText := text[idx:matchEnd]
+		var matchStyle map[string]any
+		if isCurrentMatch {
+			// Current match: bright yellow background
+			matchStyle = map[string]any{"background": "yellow", "color": "black", "bold": true}
+		} else {
+			// Other matches: dimmer highlight
+			matchStyle = map[string]any{"background": "white", "color": "black"}
+		}
+		nodes = append(nodes, <text style={matchStyle}>{matchText}</text>)
+
+		lastEnd = matchEnd
+	}
+
+	// Add remaining text
+	if lastEnd < len(text) {
+		remaining := text[lastEnd:]
+		if baseStyle != nil && len(baseStyle) > 0 {
+			nodes = append(nodes, <text style={baseStyle}>{remaining}</text>)
+		} else {
+			nodes = append(nodes, <text>{remaining}</text>)
+		}
+	}
+
+	if len(nodes) == 0 {
+		if baseStyle != nil && len(baseStyle) > 0 {
+			return []gox.VNode{<text style={baseStyle}>{text}</text>}
+		}
+		return []gox.VNode{<text>{text}</text>}
+	}
+
+	return nodes
+}
+
+// renderSegmentWithHighlight renders a segment with search highlighting, appending to nodes slice
+func renderSegmentWithHighlight(seg parser.Segment, query string, isCurrentMatch bool, baseStyle map[string]any) []gox.VNode {
+	switch seg.Type {
+	case parser.SegmentBold:
+		style := map[string]any{"bold": true}
+		if baseStyle != nil {
+			for k, v := range baseStyle {
+				style[k] = v
+			}
+		}
+		return highlightText(seg.Text, query, isCurrentMatch, style)
+	case parser.SegmentItalic:
+		style := map[string]any{"italic": true}
+		if baseStyle != nil {
+			for k, v := range baseStyle {
+				style[k] = v
+			}
+		}
+		return highlightText(seg.Text, query, isCurrentMatch, style)
+	case parser.SegmentCode:
+		// Don't highlight inside code blocks for clarity
+		return []gox.VNode{<text style={map[string]any{"background": "black", "color": "green"}}>{" " + seg.Text + " "}</text>}
+	default:
+		return highlightText(seg.Text, query, isCurrentMatch, baseStyle)
+	}
+}
+
+// LineProps defines props for Line component
+type LineProps struct {
+	Line           parser.ParsedLine
+	Links          []*LinkWrapper
+	LinkIndex      int
+	LineNumber     int      // Actual line number in document
+	SearchQuery    string   // Current search query
+	CurrentMatchLine int    // Line number of current match (-1 if none)
+}
+
+func Line(props LineProps, children ...gox.VNode) gox.VNode {
+	line := props.Line
+	lineChildren := []gox.VNode{}
+	linkIdx := props.LinkIndex
+	isCurrentMatch := props.LineNumber == props.CurrentMatchLine
+
+	// Add indent
+	if line.Indent > 0 {
+		indent := strings.Repeat(" ", line.Indent)
+		lineChildren = append(lineChildren, <text>{indent}</text>)
+	}
+
+	// Style based on line type
+	var lineStyle map[string]any
+	var prefix string
+
+	switch line.Type {
+	case parser.LineHeading1:
+		lineStyle = map[string]any{"bold": true, "color": "yellow"}
+		prefix = "▌ "
+	case parser.LineHeading2:
+		lineStyle = map[string]any{"bold": true, "color": "cyan"}
+		prefix = "  ▌ "
+	case parser.LineHeading3:
+		lineStyle = map[string]any{"bold": true, "color": "green"}
+		prefix = "    ▌ "
+	case parser.LineBlockquote:
+		lineStyle = map[string]any{"color": "white", "dim": true}
+		prefix = "  │ "
+	case parser.LineListItem:
+		lineStyle = map[string]any{}
+		prefix = "  "
+	case parser.LineHorizontalRule:
+		return <box direction="row">
+			<text style={map[string]any{"dim": true}}>{"────────────────────────────────────────────────────────────"}</text>
+		</box>
+	case parser.LineEmpty:
+		return <box direction="row"><text>{" "}</text></box>
+	}
+
+	// Add prefix for special lines
+	if prefix != "" {
+		if lineStyle != nil && len(lineStyle) > 0 {
+			lineChildren = append(lineChildren, <text style={lineStyle}>{prefix}</text>)
+		} else {
+			lineChildren = append(lineChildren, <text>{prefix}</text>)
+		}
+	}
+
+	// Render segments with search highlighting
+	for _, seg := range line.Segments {
+		if seg.Type == parser.SegmentLink {
+			// Skip empty links (they don't have LinkWrapper objects)
+			if strings.TrimSpace(seg.Text) == "" {
+				continue
+			}
+			if linkIdx < len(props.Links) {
+				lineChildren = append(lineChildren, <LinkView
+					Link={props.Links[linkIdx]}
+					Seg={seg}
+					SearchQuery={props.SearchQuery}
+					IsCurrentMatch={isCurrentMatch}
+				/>)
+				linkIdx++
+			} else {
+				// Fallback: render link text without interactivity
+				baseStyle := map[string]any{"color": "blue", "underline": true}
+				if props.SearchQuery != "" {
+					nodes := highlightText(seg.Text, props.SearchQuery, isCurrentMatch, baseStyle)
+					lineChildren = append(lineChildren, nodes...)
+				} else {
+					lineChildren = append(lineChildren, <text style={baseStyle}>{seg.Text}</text>)
+				}
+			}
+		} else {
+			// Render segment with search highlighting
+			nodes := renderSegmentWithHighlight(seg, props.SearchQuery, isCurrentMatch, lineStyle)
+			lineChildren = append(lineChildren, nodes...)
+		}
+	}
+
+	return gox.Element("box", gox.Props{"direction": "row"}, lineChildren...)
+}
+
+// TitleBarProps defines props for TitleBar component
+type TitleBarProps struct {
+	Width int
+}
+
+func TitleBar(props TitleBarProps, children ...gox.VNode) gox.VNode {
+	s := state()
+
+	title := s.Title
+	if title == "" {
+		title = s.URL
+	}
+	if s.Loading {
+		title = "Loading..."
+	}
+
+	urlText := "🌐 " + title
+
+	// Search indicator
+	searchInfo := ""
+	if s.SearchQuery != "" {
+		if len(s.SearchMatches) > 0 {
+			searchInfo = fmt.Sprintf("[%d/%d]", s.SearchIndex+1, len(s.SearchMatches))
+		} else {
+			searchInfo = "[0/0]"
+		}
+	}
+
+	hints := "q:quit  r:reload  y:copy  t:toggle  /:find  n/N:next/prev  ⏎:go  s:save  b/f:back/fwd  g/G:top/end  j/k:scroll"
+
+	// Use bright yellow text on very dark background for maximum contrast
+	darkBg := goli.RGB{R: 30, G: 30, B: 50}
+	urlBarStyle := map[string]any{"bold": true, "background": darkBg, "color": "yellow"}
+
+	// Build search info node
+	var searchNode gox.VNode
+	if searchInfo != "" {
+		searchNode = <text style={map[string]any{"bold": true, "color": "yellow"}}>{searchInfo}</text>
+	} else {
+		searchNode = <text>{""}</text>
+	}
+
+	return <box direction="column" width={props.Width}>
+		<box style={urlBarStyle} paddingTop={1} paddingBottom={1} paddingLeft={1} width={props.Width}>
+			<text style={urlBarStyle}>{urlText}</text>
+		</box>
+		<box direction="row" paddingLeft={1} gap={2}>
+			<text style={map[string]any{"dim": true}}>{hints}</text>
+			{searchNode}
+		</box>
+	</box>
+}
+
+// StatusBarProps defines props for StatusBar component
+type StatusBarProps struct{}
+
+func StatusBar(props StatusBarProps, children ...gox.VNode) gox.VNode {
+	s := state()
+	linkCount := len(s.Links)
+
+	// Find focused link index
+	focusedIdx := -1
+	for i, link := range s.Links {
+		if link.Focused() {
+			focusedIdx = i
+			break
+		}
+	}
+
+	var statusText string
+	if s.StatusMessage != "" {
+		statusText = s.StatusMessage
+	} else if s.Loading && len(s.Lines) == 0 {
+		spinner := spinnerFrames[s.SpinnerFrame]
+		statusText = spinner + " Loading..."
+	} else if s.Error != "" {
+		statusText = fmt.Sprintf("Error: %s", s.Error)
+	} else {
+		historyInfo := ""
+		if len(s.History) > 1 {
+			historyInfo = fmt.Sprintf(" | History: %d/%d", s.HistoryIndex+1, len(s.History))
+		}
+		linkInfo := ""
+		if linkCount > 0 && focusedIdx >= 0 {
+			linkInfo = fmt.Sprintf(" | Link: %d/%d", focusedIdx+1, linkCount)
+		}
+		modeInfo := ""
+		if !s.UseReadability {
+			modeInfo = " | Raw"
+		}
+		searchInfo := ""
+		if s.SearchQuery != "" {
+			searchInfo = fmt.Sprintf(" | /%s", s.SearchQuery)
+		}
+		refiningInfo := ""
+		if s.Refining {
+			spinner := spinnerFrames[s.SpinnerFrame]
+			refiningInfo = fmt.Sprintf(" | %s Rendering JS...", spinner)
+		}
+		statusText = fmt.Sprintf("%s%s%s%s%s%s", s.URL, historyInfo, linkInfo, modeInfo, searchInfo, refiningInfo)
+	}
+
+	return <box direction="row">
+		<text style={map[string]any{"bold": true}}>{statusText}</text>
+	</box>
+}
+
+// ContentProps defines props for Content component
+type ContentProps struct {
+	Height int
+}
+
+func Content(props ContentProps, children ...gox.VNode) gox.VNode {
+	s := state()
+
+	// Show spinner while loading (or waiting for initial load)
+	if s.Loading || (s.URL != "" && len(s.Lines) == 0 && s.Error == "") {
+		spinner := spinnerFrames[s.SpinnerFrame]
+		url := s.URL
+		if url == "" {
+			url = "page"
+		}
+		return <box direction="column" paddingTop={5} paddingLeft={2}>
+			<text style={map[string]any{"bold": true, "color": "cyan"}}>{spinner + " Loading " + url + "..."}</text>
+		</box>
+	}
+
+	if s.Error != "" {
+		return <box><text style={map[string]any{"color": "red"}}>{"Error: " + s.Error}</text></box>
+	}
+
+	if len(s.Lines) == 0 {
+		return <box><text style={map[string]any{"dim": true}}>{"Press a link to navigate..."}</text></box>
+	}
+
+	// Calculate visible range
+	visibleStart := s.ScrollOffset
+	visibleEnd := visibleStart + props.Height
+	if visibleEnd > len(s.Lines) {
+		visibleEnd = len(s.Lines)
+	}
+
+	// Calculate link offset for visible lines (skip empty links)
+	linkOffset := 0
+	for i := 0; i < visibleStart && i < len(s.Lines); i++ {
+		for _, seg := range s.Lines[i].Segments {
+			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+				linkOffset++
+			}
+		}
+	}
+
+	// Determine current match line
+	currentMatchLine := -1
+	if len(s.SearchMatches) > 0 && s.SearchIndex < len(s.SearchMatches) {
+		currentMatchLine = s.SearchMatches[s.SearchIndex]
+	}
+
+	contentChildren := []gox.VNode{}
+	for i := visibleStart; i < visibleEnd; i++ {
+		contentChildren = append(contentChildren, <Line
+			Line={s.Lines[i]}
+			Links={s.Links}
+			LinkIndex={linkOffset}
+			LineNumber={i}
+			SearchQuery={s.SearchQuery}
+			CurrentMatchLine={currentMatchLine}
+		/>)
+		for _, seg := range s.Lines[i].Segments {
+			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
+				linkOffset++
+			}
+		}
+	}
+
+	return gox.Element("box", gox.Props{"direction": "column"}, contentChildren...)
+}
+
+// OverlayProps defines props for Overlay component
+type OverlayProps struct {
+	Width  int
+	Height int
+}
+
+func Overlay(props OverlayProps, children ...gox.VNode) gox.VNode {
+	s := state()
+
+	if s.Overlay == OverlayNone {
+		return <box></box>
+	}
+
+	var title string
+	var placeholder string
+	var helpText string
+	switch s.Overlay {
+	case OverlayFind:
+		title = "Find"
+		placeholder = "type to search..."
+		if len(s.SearchMatches) > 0 {
+			helpText = fmt.Sprintf(" %d matches | ESC:close | ⏎:focus link ", len(s.SearchMatches))
+		} else if s.OverlayInput != "" {
+			helpText = " no matches | ESC:close "
+		} else {
+			helpText = " ESC:close "
+		}
+	case OverlaySave:
+		title = "Save"
+		placeholder = "filename..."
+		helpText = " ⏎:save | ESC:cancel "
+	}
+
+	// Overlay at top of screen, full width
+	overlayWidth := props.Width
+
+	inputText := s.OverlayInput
+	inputStyle := map[string]any{"background": "white", "color": "black"}
+	if inputText == "" {
+		inputText = placeholder
+		inputStyle = map[string]any{"background": "white", "color": "gray", "italic": true}
+	}
+
+	// Pad input to width
+	inputDisplay := " /" + inputText + " "
+	if len(inputDisplay) < overlayWidth {
+		inputDisplay = inputDisplay + strings.Repeat(" ", overlayWidth-len(inputDisplay))
+	}
+
+	// Pad title bar
+	titleDisplay := " " + title + " "
+	if len(titleDisplay) < overlayWidth {
+		titleDisplay = titleDisplay + strings.Repeat(" ", overlayWidth-len(titleDisplay))
+	}
+
+	// Pad help text to width
+	if len(helpText) < overlayWidth {
+		helpText = helpText + strings.Repeat(" ", overlayWidth-len(helpText))
+	}
+
+	return <box
+		width={overlayWidth}
+		height={4}
+		direction="column"
+	>
+		<text style={map[string]any{"bold": true, "background": "magenta", "color": "white"}}>{titleDisplay}</text>
+		<text style={inputStyle}>{inputDisplay}</text>
+		<text style={map[string]any{"dim": true}}>{helpText}</text>
+		<text>{""}</text>
+	</box>
+}
+
+// AppProps defines props for App component
+type AppProps struct{}
+
+func App(props AppProps, children ...gox.VNode) gox.VNode {
+	s := state()
+	width, height, _ := goli.GetSize(goli.Stdout())
+	if width == 0 {
+		width = 80
+	}
+	if height == 0 {
+		height = 24
+	}
+
+	// Reserve 4 lines for title bar (padding + title + padding + hints), 1 line for status bar
+	contentHeight := height - 5
+	if contentHeight < 1 {
+		contentHeight = 1
+	}
+
+	// Render overlay IN PLACE of TitleBar when active (more reliable than absolute positioning)
+	var header gox.VNode
+	if s.Overlay != OverlayNone {
+		header = <Overlay Width={width} />
+	} else {
+		header = <TitleBar Width={width} />
+	}
+
+	return <box direction="column" width={width} height={height}>
+		{header}
+		<Content Height={contentHeight} />
+		<box position="absolute" x={0} y={height - 1} width={width}>
+			<StatusBar />
+		</box>
+	</box>
+}
+
+func runInteractive(initialURL string) {
+	cleanup := goli.Manager().SetGlobalKeyHandler(func(key string) bool {
+		s := state()
+
+		// Handle overlay input mode
+		if s.Overlay != OverlayNone {
+			switch key {
+			case goli.Escape:
+				// Close overlay and restore focus
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					Overlay:        OverlayNone,
+					OverlayInput:   "",
+					SearchQuery:    s.SearchQuery,
+					SearchMatches:  s.SearchMatches,
+					SearchIndex:    s.SearchIndex,
+				})
+				restoreFocusAfterOverlay()
+				return true
+
+			case goli.Enter, goli.EnterLF:
+				// Execute overlay action
+				if s.Overlay == OverlayFind {
+					findInPage(s.OverlayInput)
+				} else if s.Overlay == OverlaySave {
+					saveToFile(s.OverlayInput)
+				}
+				return true
+
+			case goli.Backspace:
+				// Delete character
+				if len(s.OverlayInput) > 0 {
+					newInput := s.OverlayInput[:len(s.OverlayInput)-1]
+					if s.Overlay == OverlayFind {
+						// Live search
+						updateSearchResults(newInput)
+					} else {
+						setState(BrowserState{
+							URL:            s.URL,
+							Title:          s.Title,
+							RawHTML:        s.RawHTML,
+							UseReadability: s.UseReadability,
+							Lines:          s.Lines,
+							Links:          s.Links,
+							ScrollOffset:   s.ScrollOffset,
+							Loading:        s.Loading,
+							Error:          s.Error,
+							History:        s.History,
+							HistoryIndex:   s.HistoryIndex,
+							Overlay:        s.Overlay,
+							OverlayInput:   newInput,
+							SearchQuery:    s.SearchQuery,
+							SearchMatches:  s.SearchMatches,
+							SearchIndex:    s.SearchIndex,
+						})
+					}
+				}
+				return true
+
+			default:
+				// Add printable character to input
+				if len(key) == 1 && key[0] >= 32 && key[0] < 127 {
+					newInput := s.OverlayInput + key
+					if s.Overlay == OverlayFind {
+						// Live search
+						updateSearchResults(newInput)
+					} else {
+						setState(BrowserState{
+							URL:            s.URL,
+							Title:          s.Title,
+							RawHTML:        s.RawHTML,
+							UseReadability: s.UseReadability,
+							Lines:          s.Lines,
+							Links:          s.Links,
+							ScrollOffset:   s.ScrollOffset,
+							Loading:        s.Loading,
+							Error:          s.Error,
+							History:        s.History,
+							HistoryIndex:   s.HistoryIndex,
+							Overlay:        s.Overlay,
+							OverlayInput:   newInput,
+							SearchQuery:    s.SearchQuery,
+							SearchMatches:  s.SearchMatches,
+							SearchIndex:    s.SearchIndex,
+						})
+					}
+					return true
+				}
+			}
+			return true
+		}
+
+		// Normal mode key handling
+		switch key {
+		case "q", goli.CtrlC:
+			app.Quit()
+			return true
+
+		case "r":
+			reload()
+			return true
+
+		case "y":
+			copyURL()
+			return true
+
+		case "t":
+			toggleReadability()
+			return true
+
+		case "/":
+			// Open find overlay - blur links first so Enter goes to global handler
+			blurAllLinks()
+			setState(BrowserState{
+				URL:            s.URL,
+				Title:          s.Title,
+				RawHTML:        s.RawHTML,
+				UseReadability: s.UseReadability,
+				Lines:          s.Lines,
+				Links:          s.Links,
+				ScrollOffset:   s.ScrollOffset,
+				Loading:        s.Loading,
+				Error:          s.Error,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+				Overlay:        OverlayFind,
+				OverlayInput:   "",
+				SearchQuery:    s.SearchQuery,
+				SearchMatches:  s.SearchMatches,
+				SearchIndex:    s.SearchIndex,
+			})
+			return true
+
+		case "s":
+			// Open save overlay with suggested filename - blur links first
+			blurAllLinks()
+			suggestedName := "page"
+			if s.Title != "" {
+				// Sanitize title for filename
+				suggestedName = strings.Map(func(r rune) rune {
+					if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+						return '-'
+					}
+					return r
+				}, s.Title)
+				if len(suggestedName) > 50 {
+					suggestedName = suggestedName[:50]
+				}
+			}
+			setState(BrowserState{
+				URL:            s.URL,
+				Title:          s.Title,
+				RawHTML:        s.RawHTML,
+				UseReadability: s.UseReadability,
+				Lines:          s.Lines,
+				Links:          s.Links,
+				ScrollOffset:   s.ScrollOffset,
+				Loading:        s.Loading,
+				Error:          s.Error,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+				Overlay:        OverlaySave,
+				OverlayInput:   suggestedName,
+				SearchQuery:    s.SearchQuery,
+				SearchMatches:  s.SearchMatches,
+				SearchIndex:    s.SearchIndex,
+			})
+			return true
+
+		case "n":
+			nextMatch()
+			return true
+
+		case "N":
+			prevMatch()
+			return true
+
+		case goli.Enter, goli.EnterLF:
+			// If we have an active search, focus the link at current match
+			if s.SearchQuery != "" && len(s.SearchMatches) > 0 {
+				if focusLinkAtCurrentMatch() {
+					return true
+				}
+			}
+			// Otherwise let the focused link handle it
+			return false
+
+		case goli.Escape:
+			// Clear search
+			if s.SearchQuery != "" {
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					SearchQuery:    "",
+					SearchMatches:  nil,
+					SearchIndex:    0,
+				})
+				return true
+			}
+			return false
+
+		case "b":
+			goBack()
+			return true
+
+		case "f":
+			goForward()
+			return true
+
+		case "j", goli.Down:
+			if s.ScrollOffset < len(s.Lines)-1 {
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset + 1,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					SearchQuery:    s.SearchQuery,
+					SearchMatches:  s.SearchMatches,
+					SearchIndex:    s.SearchIndex,
+				})
+			}
+			return true
+
+		case "k", goli.Up:
+			if s.ScrollOffset > 0 {
+				setState(BrowserState{
+					URL:            s.URL,
+					Title:          s.Title,
+					RawHTML:        s.RawHTML,
+					UseReadability: s.UseReadability,
+					Lines:          s.Lines,
+					Links:          s.Links,
+					ScrollOffset:   s.ScrollOffset - 1,
+					Loading:        s.Loading,
+					Error:          s.Error,
+					History:        s.History,
+					HistoryIndex:   s.HistoryIndex,
+					SearchQuery:    s.SearchQuery,
+					SearchMatches:  s.SearchMatches,
+					SearchIndex:    s.SearchIndex,
+				})
+			}
+			return true
+
+		case goli.PageDown:
+			_, height, _ := goli.GetSize(goli.Stdout())
+			if height == 0 {
+				height = 24
+			}
+			newOffset := s.ScrollOffset + height - 2
+			if newOffset > len(s.Lines)-1 {
+				newOffset = len(s.Lines) - 1
+			}
+			if newOffset < 0 {
+				newOffset = 0
+			}
+			setState(BrowserState{
+				URL:            s.URL,
+				Title:          s.Title,
+				RawHTML:        s.RawHTML,
+				UseReadability: s.UseReadability,
+				Lines:          s.Lines,
+				Links:          s.Links,
+				ScrollOffset:   newOffset,
+				Loading:        s.Loading,
+				Error:          s.Error,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+				SearchQuery:    s.SearchQuery,
+				SearchMatches:  s.SearchMatches,
+				SearchIndex:    s.SearchIndex,
+			})
+			return true
+
+		case goli.PageUp:
+			_, height, _ := goli.GetSize(goli.Stdout())
+			if height == 0 {
+				height = 24
+			}
+			newOffset := s.ScrollOffset - (height - 2)
+			if newOffset < 0 {
+				newOffset = 0
+			}
+			setState(BrowserState{
+				URL:            s.URL,
+				Title:          s.Title,
+				RawHTML:        s.RawHTML,
+				UseReadability: s.UseReadability,
+				Lines:          s.Lines,
+				Links:          s.Links,
+				ScrollOffset:   newOffset,
+				Loading:        s.Loading,
+				Error:          s.Error,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+				SearchQuery:    s.SearchQuery,
+				SearchMatches:  s.SearchMatches,
+				SearchIndex:    s.SearchIndex,
+			})
+			return true
+
+		case "g":
+			setState(BrowserState{
+				URL:            s.URL,
+				Title:          s.Title,
+				RawHTML:        s.RawHTML,
+				UseReadability: s.UseReadability,
+				Lines:          s.Lines,
+				Links:          s.Links,
+				ScrollOffset:   0,
+				Loading:        s.Loading,
+				Error:          s.Error,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+				SearchQuery:    s.SearchQuery,
+				SearchMatches:  s.SearchMatches,
+				SearchIndex:    s.SearchIndex,
+			})
+			return true
+
+		case "G":
+			_, height, _ := goli.GetSize(goli.Stdout())
+			if height == 0 {
+				height = 24
+			}
+			newOffset := len(s.Lines) - (height - 2)
+			if newOffset < 0 {
+				newOffset = 0
+			}
+			setState(BrowserState{
+				URL:            s.URL,
+				Title:          s.Title,
+				RawHTML:        s.RawHTML,
+				UseReadability: s.UseReadability,
+				Lines:          s.Lines,
+				Links:          s.Links,
+				ScrollOffset:   newOffset,
+				Loading:        s.Loading,
+				Error:          s.Error,
+				History:        s.History,
+				HistoryIndex:   s.HistoryIndex,
+				SearchQuery:    s.SearchQuery,
+				SearchMatches:  s.SearchMatches,
+				SearchIndex:    s.SearchIndex,
+			})
+			return true
+		}
+
+		return false
+	})
+	defer cleanup()
+
+	// Set initial state with URL so spinner shows immediately
+	setState(BrowserState{
+		URL:     initialURL,
+		Loading: true,
+	})
+	startSpinner()
+
+	goli.Run(func() gox.VNode {
+		return <App />
+	}, goli.RunOptions{
+		OnMount: func(a *goli.App) {
+			app = a
+			navigate(initialURL, true)
+		},
+	})
+}
+
+func runNonInteractive(targetURL string) {
+	// Resolve redirect URLs (e.g., DuckDuckGo redirects)
+	targetURL = fetch.ResolveRedirectURL(targetURL)
+
+	var html string
+	var err error
+	if jsMode {
+		// Check if browser is available
+		if !fetch.CheckBrowserAvailable() {
+			fmt.Fprintf(os.Stderr, "Error: Chrome/Chromium not found. JS mode requires a browser.\n")
+			fmt.Fprintf(os.Stderr, "Please install Chrome or Chromium.\n")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Rendering with JavaScript (this may take a few seconds)...\n")
+		html, err = fetch.FetchHTMLWithJS(targetURL)
+	} else if liteMode {
+		html, err = fetch.FetchHTMLLite(targetURL)
+	} else {
+		html, err = fetch.FetchHTML(targetURL)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error fetching URL: %v\n", err)
+		os.Exit(1)
+	}
+
+	result, err := convert.ConvertToMarkdown(html, targetURL)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error converting HTML: %v\n", err)
+		os.Exit(1)
+	}
+
+	if result.Title != "" {
+		fmt.Printf("# %s\n\n", result.Title)
+	}
+	fmt.Println(result.Markdown)
+}
+
+// Global mode flags
+var liteMode = false
+var jsMode = false
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: gowser [options] <url or search query>")
+		fmt.Println("")
+		fmt.Println("Options:")
+		fmt.Println("  -i          Interactive mode with navigable links")
+		fmt.Println("  -s          Search with DuckDuckGo (query follows)")
+		fmt.Println("  -l, -lite   Lite mode: request text/no-JS versions when available")
+		fmt.Println("  -j, -js     JS mode: use headless browser for JavaScript-heavy sites")
+		fmt.Println("")
+		fmt.Println("Flags can be combined: -il, -sil, -ij, -sij")
+		fmt.Println("")
+		fmt.Println("Examples:")
+		fmt.Println("  gowser example.com              # Fetch and show markdown")
+		fmt.Println("  gowser -i example.com           # Interactive browsing")
+		fmt.Println("  gowser -l reddit.com            # Use old.reddit.com (lite version)")
+		fmt.Println("  gowser -j twitter.com           # Render JS before extracting content")
+		fmt.Println("  gowser -ij react-app.com        # Interactive + JS rendering")
+		fmt.Println("  gowser -s cli web browser       # DuckDuckGo search")
+		fmt.Println("  gowser -sil golang tutorial     # Search interactive lite")
+		fmt.Println("")
+		fmt.Println("Lite mode mappings:")
+		fmt.Println("  reddit.com    -> old.reddit.com")
+		fmt.Println("  twitter.com   -> nitter.net")
+		fmt.Println("  x.com         -> nitter.net")
+		fmt.Println("  cnn.com       -> lite.cnn.com")
+		fmt.Println("  npr.org       -> text.npr.org")
+		fmt.Println("  wikipedia.org -> mobile version")
+		fmt.Println("")
+		fmt.Println("JS mode requires Chrome/Chromium installed on your system.")
+		os.Exit(1)
+	}
+
+	interactive := false
+	search := false
+	var targetURL string
+	argIdx := 1
+
+	// Parse flags
+	for argIdx < len(os.Args) {
+		arg := os.Args[argIdx]
+		if arg == "-i" {
+			interactive = true
+			argIdx++
+		} else if arg == "-s" {
+			search = true
+			argIdx++
+		} else if arg == "-l" || arg == "-lite" {
+			liteMode = true
+			argIdx++
+		} else if arg == "-j" || arg == "-js" {
+			jsMode = true
+			argIdx++
+		} else if strings.HasPrefix(arg, "-") && len(arg) > 1 {
+			// Handle combined flags like -il, -sl, -sil, -ij, etc.
+			flags := arg[1:]
+			for _, f := range flags {
+				switch f {
+				case 'i':
+					interactive = true
+				case 's':
+					search = true
+				case 'l':
+					liteMode = true
+				case 'j':
+					jsMode = true
+				}
+			}
+			argIdx++
+		} else {
+			break
+		}
+	}
+
+	if argIdx >= len(os.Args) {
+		fmt.Println("Error: missing URL or search query")
+		os.Exit(1)
+	}
+
+	if search {
+		// Join remaining args as search query - use DuckDuckGo HTML version
+		query := strings.Join(os.Args[argIdx:], " ")
+		targetURL = "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	} else {
+		targetURL = os.Args[argIdx]
+		// Ensure URL has a scheme
+		if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+			targetURL = "https://" + targetURL
+		}
+	}
+
+	if interactive {
+		runInteractive(targetURL)
+	} else {
+		runNonInteractive(targetURL)
+	}
+}
