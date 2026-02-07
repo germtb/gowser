@@ -12,15 +12,11 @@ import (
 
 	"github.com/germtb/goli"
 	"github.com/germtb/gox"
-
-	"github.com/germtb/gowser/internal/convert"
-	"github.com/germtb/gowser/internal/fetch"
-	"github.com/germtb/gowser/internal/parser"
 )
 
 // Helper to check if segment is a link
-func isLink(seg parser.Segment) bool {
-	return seg.Type == parser.SegmentLink
+func isLink(seg Segment) bool {
+	return seg.Type == SegmentLink
 }
 
 // LinkWrapper wraps goli.Link with additional metadata for our browser
@@ -114,7 +110,7 @@ type BrowserState struct {
 	Title          string
 	RawHTML        string // Store raw HTML for readability toggle
 	UseReadability bool   // Current readability mode
-	Lines          []parser.ParsedLine
+	Lines          []ParsedLine
 	Links          []*LinkWrapper
 	ScrollOffset   int
 	Loading        bool   // Initial loading (no content yet)
@@ -350,7 +346,7 @@ func scrollLinkIntoView(link *LinkWrapper) {
 // In JS mode, uses two-phase rendering: quick HTTP first, then rod refines.
 func navigate(targetURL string, addToHistory bool) {
 	// Resolve redirect URLs (e.g., DuckDuckGo redirects)
-	targetURL = fetch.ResolveRedirectURL(targetURL)
+	targetURL = ResolveRedirectURL(targetURL)
 
 	s := state()
 
@@ -395,15 +391,15 @@ func navigate(targetURL string, addToHistory bool) {
 		var html string
 		var err error
 		if liteMode {
-			html, err = fetch.FetchHTMLLite(targetURL)
+			html, err = FetchHTMLLite(targetURL)
 		} else {
-			html, err = fetch.FetchHTML(targetURL)
+			html, err = FetchHTML(targetURL)
 		}
 
 		if err != nil {
 			// If HTTP fetch fails and we're in JS mode, try JS-only
 			if jsMode {
-				html, err = fetch.FetchHTMLWithJS(targetURL)
+				html, err = FetchHTMLWithJS(targetURL)
 				if err != nil {
 					goli.BatchVoid(func() {
 						stopSpinner()
@@ -442,7 +438,7 @@ func navigate(targetURL string, addToHistory bool) {
 		// Phase 2: If JS mode, refine with rod in background
 		if jsMode && err == nil {
 			go func() {
-				jsHTML, jsErr := fetch.FetchHTMLWithJS(targetURL)
+				jsHTML, jsErr := FetchHTMLWithJS(targetURL)
 				if jsErr == nil && jsHTML != html {
 					// Only update if content changed
 					displayContent(targetURL, jsHTML, false)
@@ -483,12 +479,12 @@ func displayContent(targetURL string, html string, startRefining bool) {
 	currentState := state()
 	useReadability := currentState.UseReadability
 
-	var result convert.Result
+	var result Result
 	var err error
 	if useReadability {
-		result, err = convert.ConvertToMarkdown(html, targetURL)
+		result, err = ConvertToMarkdown(html, targetURL)
 	} else {
-		result, err = convert.ConvertToMarkdownRaw(html, targetURL)
+		result, err = ConvertToMarkdownRaw(html, targetURL)
 	}
 	if err != nil {
 		goli.BatchVoid(func() {
@@ -506,7 +502,7 @@ func displayContent(targetURL string, html string, startRefining bool) {
 		return
 	}
 
-	lines := parser.ParseMarkdown(result.Markdown)
+	lines := ParseMarkdown(result.Markdown)
 
 	// Dispose old links before creating new ones
 	goli.BatchVoid(func() {
@@ -591,18 +587,18 @@ func toggleReadability() {
 
 	newUseReadability := !s.UseReadability
 
-	var result convert.Result
+	var result Result
 	var err error
 	if newUseReadability {
-		result, err = convert.ConvertToMarkdown(s.RawHTML, s.URL)
+		result, err = ConvertToMarkdown(s.RawHTML, s.URL)
 	} else {
-		result, err = convert.ConvertToMarkdownRaw(s.RawHTML, s.URL)
+		result, err = ConvertToMarkdownRaw(s.RawHTML, s.URL)
 	}
 	if err != nil {
 		return
 	}
 
-	lines := parser.ParseMarkdown(result.Markdown)
+	lines := ParseMarkdown(result.Markdown)
 
 	// Create links using goli's Link primitive (skip empty links)
 	var links []*LinkWrapper
@@ -981,7 +977,7 @@ func saveToFile(filename string) {
 	// Reconstruct markdown from lines
 	for _, line := range s.Lines {
 		for _, seg := range line.Segments {
-			if seg.Type == parser.SegmentLink {
+			if seg.Type == SegmentLink {
 				content.WriteString("[")
 				content.WriteString(seg.Text)
 				content.WriteString("](")
@@ -1210,13 +1206,13 @@ func getLinkIndex(link *LinkWrapper) int {
 // LinkViewProps defines props for LinkView component
 type LinkViewProps struct {
 	Link           *LinkWrapper
-	Seg            parser.Segment // The segment with parsed Children
+	Seg            Segment // The segment with parsed Children
 	SearchQuery    string
 	IsCurrentMatch bool
 }
 
 // renderLinkChildren renders link children with formatting and optional search highlighting
-func renderLinkChildren(children []parser.Segment, query string, isCurrentMatch bool) []gox.VNode {
+func renderLinkChildren(children []Segment, query string, isCurrentMatch bool) []gox.VNode {
 	var nodes []gox.VNode
 	baseStyle := map[string]any{"color": "blue", "underline": true}
 
@@ -1228,11 +1224,11 @@ func renderLinkChildren(children []parser.Segment, query string, isCurrentMatch 
 		}
 
 		switch child.Type {
-		case parser.SegmentBold:
+		case SegmentBold:
 			style["bold"] = true
-		case parser.SegmentItalic:
+		case SegmentItalic:
 			style["italic"] = true
-		case parser.SegmentCode:
+		case SegmentCode:
 			style["background"] = "black"
 			style["color"] = "green"
 		}
@@ -1350,9 +1346,9 @@ func highlightText(text string, query string, isCurrentMatch bool, baseStyle map
 }
 
 // renderSegmentWithHighlight renders a segment with search highlighting, appending to nodes slice
-func renderSegmentWithHighlight(seg parser.Segment, query string, isCurrentMatch bool, baseStyle map[string]any) []gox.VNode {
+func renderSegmentWithHighlight(seg Segment, query string, isCurrentMatch bool, baseStyle map[string]any) []gox.VNode {
 	switch seg.Type {
-	case parser.SegmentBold:
+	case SegmentBold:
 		style := map[string]any{"bold": true}
 		if baseStyle != nil {
 			for k, v := range baseStyle {
@@ -1360,7 +1356,7 @@ func renderSegmentWithHighlight(seg parser.Segment, query string, isCurrentMatch
 			}
 		}
 		return highlightText(seg.Text, query, isCurrentMatch, style)
-	case parser.SegmentItalic:
+	case SegmentItalic:
 		style := map[string]any{"italic": true}
 		if baseStyle != nil {
 			for k, v := range baseStyle {
@@ -1368,7 +1364,7 @@ func renderSegmentWithHighlight(seg parser.Segment, query string, isCurrentMatch
 			}
 		}
 		return highlightText(seg.Text, query, isCurrentMatch, style)
-	case parser.SegmentCode:
+	case SegmentCode:
 		// Don't highlight inside code blocks for clarity
 		return []gox.VNode{<text style={map[string]any{"background": "black", "color": "green"}}>{" " + seg.Text + " "}</text>}
 	default:
@@ -1378,7 +1374,7 @@ func renderSegmentWithHighlight(seg parser.Segment, query string, isCurrentMatch
 
 // LineProps defines props for Line component
 type LineProps struct {
-	Line           parser.ParsedLine
+	Line           ParsedLine
 	Links          []*LinkWrapper
 	LinkIndex      int
 	LineNumber     int      // Actual line number in document
@@ -1403,26 +1399,26 @@ func Line(props LineProps, children ...gox.VNode) gox.VNode {
 	var prefix string
 
 	switch line.Type {
-	case parser.LineHeading1:
+	case LineHeading1:
 		lineStyle = map[string]any{"bold": true, "color": "yellow"}
 		prefix = "▌ "
-	case parser.LineHeading2:
+	case LineHeading2:
 		lineStyle = map[string]any{"bold": true, "color": "cyan"}
 		prefix = "  ▌ "
-	case parser.LineHeading3:
+	case LineHeading3:
 		lineStyle = map[string]any{"bold": true, "color": "green"}
 		prefix = "    ▌ "
-	case parser.LineBlockquote:
+	case LineBlockquote:
 		lineStyle = map[string]any{"color": "white", "dim": true}
 		prefix = "  │ "
-	case parser.LineListItem:
+	case LineListItem:
 		lineStyle = map[string]any{}
 		prefix = "  "
-	case parser.LineHorizontalRule:
+	case LineHorizontalRule:
 		return <box direction="row">
 			<text style={map[string]any{"dim": true}}>{"────────────────────────────────────────────────────────────"}</text>
 		</box>
-	case parser.LineEmpty:
+	case LineEmpty:
 		return <box direction="row"><text>{" "}</text></box>
 	}
 
@@ -1437,7 +1433,7 @@ func Line(props LineProps, children ...gox.VNode) gox.VNode {
 
 	// Render segments with search highlighting
 	for _, seg := range line.Segments {
-		if seg.Type == parser.SegmentLink {
+		if seg.Type == SegmentLink {
 			// Skip empty links (they don't have LinkWrapper objects)
 			if strings.TrimSpace(seg.Text) == "" {
 				continue
@@ -2153,30 +2149,30 @@ func runInteractive(initialURL string) {
 
 func runNonInteractive(targetURL string) {
 	// Resolve redirect URLs (e.g., DuckDuckGo redirects)
-	targetURL = fetch.ResolveRedirectURL(targetURL)
+	targetURL = ResolveRedirectURL(targetURL)
 
 	var html string
 	var err error
 	if jsMode {
 		// Check if browser is available
-		if !fetch.CheckBrowserAvailable() {
+		if !CheckBrowserAvailable() {
 			fmt.Fprintf(os.Stderr, "Error: Chrome/Chromium not found. JS mode requires a browser.\n")
 			fmt.Fprintf(os.Stderr, "Please install Chrome or Chromium.\n")
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "Rendering with JavaScript (this may take a few seconds)...\n")
-		html, err = fetch.FetchHTMLWithJS(targetURL)
+		html, err = FetchHTMLWithJS(targetURL)
 	} else if liteMode {
-		html, err = fetch.FetchHTMLLite(targetURL)
+		html, err = FetchHTMLLite(targetURL)
 	} else {
-		html, err = fetch.FetchHTML(targetURL)
+		html, err = FetchHTML(targetURL)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching URL: %v\n", err)
 		os.Exit(1)
 	}
 
-	result, err := convert.ConvertToMarkdown(html, targetURL)
+	result, err := ConvertToMarkdown(html, targetURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error converting HTML: %v\n", err)
 		os.Exit(1)

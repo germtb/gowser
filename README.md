@@ -108,11 +108,10 @@ gowser -si golang tutorial
 
 ```
 gowser/
-├── main.gox              # Main TUI application (gox/JSX syntax)
-└── internal/
-    ├── fetch/fetch.go    # HTTP fetching + headless browser (rod)
-    ├── convert/convert.go # HTML to markdown conversion
-    └── parser/parser.go  # Markdown parsing for TUI rendering
+├── main.gox     # Main TUI application (gox/JSX syntax)
+├── fetch.go     # HTTP fetching + headless browser (rod)
+├── convert.go   # HTML to markdown conversion
+└── parser.go    # Markdown parsing for TUI rendering
 ```
 
 ### Dependencies
