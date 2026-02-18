@@ -4,9 +4,6 @@ gowser
 # Claude Code local settings
 .claude/
 
-# Generated Go files from gox transpilation
-*_gox.go
-
 # IDE/Editor
 .idea/
 .vscode/

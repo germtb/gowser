@@ -113,8 +113,8 @@ type BrowserState struct {
 	Lines          []ParsedLine
 	Links          []*LinkWrapper
 	ScrollOffset   int
-	Loading        bool   // Initial loading (no content yet)
-	Refining       bool   // JS rendering in background (have initial content)
+	Loading        bool // Initial loading (no content yet)
+	Refining       bool // JS rendering in background (have initial content)
 	Error          string
 	History        []HistoryEntry
 	HistoryIndex   int
@@ -1237,12 +1237,14 @@ func renderLinkChildren(children []Segment, query string, isCurrentMatch bool) [
 		if query != "" {
 			nodes = append(nodes, highlightText(child.Text, query, isCurrentMatch, style)...)
 		} else {
-			nodes = append(nodes, <text style={style}>{child.Text}</text>)
+			nodes = append(nodes, gox.Element("text", gox.Props{"style": style},
+				gox.V(child.Text)))
 		}
 	}
 
 	if len(nodes) == 0 {
-		return []gox.VNode{<text style={baseStyle}>{""}</text>}
+		return []gox.VNode{gox.Element("text", gox.Props{"style": baseStyle},
+			gox.V(""))}
 	}
 
 	return nodes
@@ -1257,7 +1259,8 @@ func LinkView(props LinkViewProps, children ...gox.VNode) gox.VNode {
 
 	// If link is focused, show focus style (yellow background)
 	if focused {
-		return <text style={map[string]any{"background": "yellow", "color": "black", "bold": true}}>{link.text}</text>
+		return gox.Element("text", gox.Props{"style": map[string]any{"background": "yellow", "color": "black", "bold": true}},
+			gox.V(link.text))
 	}
 
 	// Use parsed children for proper formatting
@@ -1272,16 +1275,19 @@ func LinkView(props LinkViewProps, children ...gox.VNode) gox.VNode {
 		nodes := highlightText(link.text, query, isCurrent, baseStyle)
 		return gox.Element("box", gox.Props{"direction": "row"}, nodes...)
 	}
-	return <text style={baseStyle}>{link.text}</text>
+	return gox.Element("text", gox.Props{"style": baseStyle},
+		gox.V(link.text))
 }
 
 // highlightText splits text at search matches and returns nodes with highlighting
 func highlightText(text string, query string, isCurrentMatch bool, baseStyle map[string]any) []gox.VNode {
 	if query == "" || text == "" {
 		if baseStyle != nil && len(baseStyle) > 0 {
-			return []gox.VNode{<text style={baseStyle}>{text}</text>}
+			return []gox.VNode{gox.Element("text", gox.Props{"style": baseStyle},
+				gox.V(text))}
 		}
-		return []gox.VNode{<text>{text}</text>}
+		return []gox.VNode{gox.Element("text", nil,
+			gox.V(text))}
 	}
 
 	queryLower := strings.ToLower(query)
@@ -1300,9 +1306,11 @@ func highlightText(text string, query string, isCurrentMatch bool, baseStyle map
 		if idx > lastEnd {
 			before := text[lastEnd:idx]
 			if baseStyle != nil && len(baseStyle) > 0 {
-				nodes = append(nodes, <text style={baseStyle}>{before}</text>)
+				nodes = append(nodes, gox.Element("text", gox.Props{"style": baseStyle},
+					gox.V(before)))
 			} else {
-				nodes = append(nodes, <text>{before}</text>)
+				nodes = append(nodes, gox.Element("text", nil,
+					gox.V(before)))
 			}
 		}
 
@@ -1320,7 +1328,8 @@ func highlightText(text string, query string, isCurrentMatch bool, baseStyle map
 			// Other matches: dimmer highlight
 			matchStyle = map[string]any{"background": "white", "color": "black"}
 		}
-		nodes = append(nodes, <text style={matchStyle}>{matchText}</text>)
+		nodes = append(nodes, gox.Element("text", gox.Props{"style": matchStyle},
+			gox.V(matchText)))
 
 		lastEnd = matchEnd
 	}
@@ -1329,17 +1338,21 @@ func highlightText(text string, query string, isCurrentMatch bool, baseStyle map
 	if lastEnd < len(text) {
 		remaining := text[lastEnd:]
 		if baseStyle != nil && len(baseStyle) > 0 {
-			nodes = append(nodes, <text style={baseStyle}>{remaining}</text>)
+			nodes = append(nodes, gox.Element("text", gox.Props{"style": baseStyle},
+				gox.V(remaining)))
 		} else {
-			nodes = append(nodes, <text>{remaining}</text>)
+			nodes = append(nodes, gox.Element("text", nil,
+				gox.V(remaining)))
 		}
 	}
 
 	if len(nodes) == 0 {
 		if baseStyle != nil && len(baseStyle) > 0 {
-			return []gox.VNode{<text style={baseStyle}>{text}</text>}
+			return []gox.VNode{gox.Element("text", gox.Props{"style": baseStyle},
+				gox.V(text))}
 		}
-		return []gox.VNode{<text>{text}</text>}
+		return []gox.VNode{gox.Element("text", nil,
+			gox.V(text))}
 	}
 
 	return nodes
@@ -1366,7 +1379,8 @@ func renderSegmentWithHighlight(seg Segment, query string, isCurrentMatch bool, 
 		return highlightText(seg.Text, query, isCurrentMatch, style)
 	case SegmentCode:
 		// Don't highlight inside code blocks for clarity
-		return []gox.VNode{<text style={map[string]any{"background": "black", "color": "green"}}>{" " + seg.Text + " "}</text>}
+		return []gox.VNode{gox.Element("text", gox.Props{"style": map[string]any{"background": "black", "color": "green"}},
+			gox.V(" "+seg.Text+" "))}
 	default:
 		return highlightText(seg.Text, query, isCurrentMatch, baseStyle)
 	}
@@ -1374,11 +1388,11 @@ func renderSegmentWithHighlight(seg Segment, query string, isCurrentMatch bool, 
 
 // LineProps defines props for Line component
 type LineProps struct {
-	Line           ParsedLine
-	Links          []*LinkWrapper
-	LinkIndex      int
-	LineNumber     int      // Actual line number in document
-	SearchQuery    string   // Current search query
+	Line             ParsedLine
+	Links            []*LinkWrapper
+	LinkIndex        int
+	LineNumber       int    // Actual line number in document
+	SearchQuery      string // Current search query
 	CurrentMatchLine int    // Line number of current match (-1 if none)
 }
 
@@ -1391,7 +1405,8 @@ func Line(props LineProps, children ...gox.VNode) gox.VNode {
 	// Add indent
 	if line.Indent > 0 {
 		indent := strings.Repeat(" ", line.Indent)
-		lineChildren = append(lineChildren, <text>{indent}</text>)
+		lineChildren = append(lineChildren, gox.Element("text", nil,
+			gox.V(indent)))
 	}
 
 	// Style based on line type
@@ -1415,19 +1430,23 @@ func Line(props LineProps, children ...gox.VNode) gox.VNode {
 		lineStyle = map[string]any{}
 		prefix = "  "
 	case LineHorizontalRule:
-		return <box direction="row">
-			<text style={map[string]any{"dim": true}}>{"────────────────────────────────────────────────────────────"}</text>
-		</box>
+		return gox.Element("box", gox.Props{"direction": "row"},
+			gox.Element("text", gox.Props{"style": map[string]any{"dim": true}},
+				gox.V("────────────────────────────────────────────────────────────")))
 	case LineEmpty:
-		return <box direction="row"><text>{" "}</text></box>
+		return gox.Element("box", gox.Props{"direction": "row"},
+			gox.Element("text", nil,
+				gox.V(" ")))
 	}
 
 	// Add prefix for special lines
 	if prefix != "" {
 		if lineStyle != nil && len(lineStyle) > 0 {
-			lineChildren = append(lineChildren, <text style={lineStyle}>{prefix}</text>)
+			lineChildren = append(lineChildren, gox.Element("text", gox.Props{"style": lineStyle},
+				gox.V(prefix)))
 		} else {
-			lineChildren = append(lineChildren, <text>{prefix}</text>)
+			lineChildren = append(lineChildren, gox.Element("text", nil,
+				gox.V(prefix)))
 		}
 	}
 
@@ -1439,12 +1458,7 @@ func Line(props LineProps, children ...gox.VNode) gox.VNode {
 				continue
 			}
 			if linkIdx < len(props.Links) {
-				lineChildren = append(lineChildren, <LinkView
-					Link={props.Links[linkIdx]}
-					Seg={seg}
-					SearchQuery={props.SearchQuery}
-					IsCurrentMatch={isCurrentMatch}
-				/>)
+				lineChildren = append(lineChildren, LinkView(LinkViewProps{Link: props.Links[linkIdx], Seg: seg, SearchQuery: props.SearchQuery, IsCurrentMatch: isCurrentMatch}))
 				linkIdx++
 			} else {
 				// Fallback: render link text without interactivity
@@ -1453,7 +1467,8 @@ func Line(props LineProps, children ...gox.VNode) gox.VNode {
 					nodes := highlightText(seg.Text, props.SearchQuery, isCurrentMatch, baseStyle)
 					lineChildren = append(lineChildren, nodes...)
 				} else {
-					lineChildren = append(lineChildren, <text style={baseStyle}>{seg.Text}</text>)
+					lineChildren = append(lineChildren, gox.Element("text", gox.Props{"style": baseStyle},
+						gox.V(seg.Text)))
 				}
 			}
 		} else {
@@ -1503,20 +1518,21 @@ func TitleBar(props TitleBarProps, children ...gox.VNode) gox.VNode {
 	// Build search info node
 	var searchNode gox.VNode
 	if searchInfo != "" {
-		searchNode = <text style={map[string]any{"bold": true, "color": "yellow"}}>{searchInfo}</text>
+		searchNode = gox.Element("text", gox.Props{"style": map[string]any{"bold": true, "color": "yellow"}},
+			gox.V(searchInfo))
 	} else {
-		searchNode = <text>{""}</text>
+		searchNode = gox.Element("text", nil,
+			gox.V(""))
 	}
 
-	return <box direction="column" width={props.Width}>
-		<box style={urlBarStyle} paddingTop={1} paddingBottom={1} paddingLeft={1} width={props.Width}>
-			<text style={urlBarStyle}>{urlText}</text>
-		</box>
-		<box direction="row" paddingLeft={1} gap={2}>
-			<text style={map[string]any{"dim": true}}>{hints}</text>
-			{searchNode}
-		</box>
-	</box>
+	return gox.Element("box", gox.Props{"direction": "column", "width": props.Width},
+		gox.Element("box", gox.Props{"style": urlBarStyle, "paddingTop": 1, "paddingBottom": 1, "paddingLeft": 1, "width": props.Width},
+			gox.Element("text", gox.Props{"style": urlBarStyle},
+				gox.V(urlText))),
+		gox.Element("box", gox.Props{"direction": "row", "paddingLeft": 1, "gap": 2},
+			gox.Element("text", gox.Props{"style": map[string]any{"dim": true}},
+				gox.V(hints)),
+			gox.V(searchNode)))
 }
 
 // StatusBarProps defines props for StatusBar component
@@ -1568,9 +1584,9 @@ func StatusBar(props StatusBarProps, children ...gox.VNode) gox.VNode {
 		statusText = fmt.Sprintf("%s%s%s%s%s%s", s.URL, historyInfo, linkInfo, modeInfo, searchInfo, refiningInfo)
 	}
 
-	return <box direction="row">
-		<text style={map[string]any{"bold": true}}>{statusText}</text>
-	</box>
+	return gox.Element("box", gox.Props{"direction": "row"},
+		gox.Element("text", gox.Props{"style": map[string]any{"bold": true}},
+			gox.V(statusText)))
 }
 
 // ContentProps defines props for Content component
@@ -1588,17 +1604,21 @@ func Content(props ContentProps, children ...gox.VNode) gox.VNode {
 		if url == "" {
 			url = "page"
 		}
-		return <box direction="column" paddingTop={5} paddingLeft={2}>
-			<text style={map[string]any{"bold": true, "color": "cyan"}}>{spinner + " Loading " + url + "..."}</text>
-		</box>
+		return gox.Element("box", gox.Props{"direction": "column", "paddingTop": 5, "paddingLeft": 2},
+			gox.Element("text", gox.Props{"style": map[string]any{"bold": true, "color": "cyan"}},
+				gox.V(spinner+" Loading "+url+"...")))
 	}
 
 	if s.Error != "" {
-		return <box><text style={map[string]any{"color": "red"}}>{"Error: " + s.Error}</text></box>
+		return gox.Element("box", nil,
+			gox.Element("text", gox.Props{"style": map[string]any{"color": "red"}},
+				gox.V("Error: "+s.Error)))
 	}
 
 	if len(s.Lines) == 0 {
-		return <box><text style={map[string]any{"dim": true}}>{"Press a link to navigate..."}</text></box>
+		return gox.Element("box", nil,
+			gox.Element("text", gox.Props{"style": map[string]any{"dim": true}},
+				gox.V("Press a link to navigate...")))
 	}
 
 	// Calculate visible range
@@ -1626,14 +1646,7 @@ func Content(props ContentProps, children ...gox.VNode) gox.VNode {
 
 	contentChildren := []gox.VNode{}
 	for i := visibleStart; i < visibleEnd; i++ {
-		contentChildren = append(contentChildren, <Line
-			Line={s.Lines[i]}
-			Links={s.Links}
-			LinkIndex={linkOffset}
-			LineNumber={i}
-			SearchQuery={s.SearchQuery}
-			CurrentMatchLine={currentMatchLine}
-		/>)
+		contentChildren = append(contentChildren, Line(LineProps{Line: s.Lines[i], Links: s.Links, LinkIndex: linkOffset, LineNumber: i, SearchQuery: s.SearchQuery, CurrentMatchLine: currentMatchLine}))
 		for _, seg := range s.Lines[i].Segments {
 			if isLink(seg) && strings.TrimSpace(seg.Text) != "" {
 				linkOffset++
@@ -1654,7 +1667,7 @@ func Overlay(props OverlayProps, children ...gox.VNode) gox.VNode {
 	s := state()
 
 	if s.Overlay == OverlayNone {
-		return <box></box>
+		return gox.Element("box", nil)
 	}
 
 	var title string
@@ -1704,16 +1717,15 @@ func Overlay(props OverlayProps, children ...gox.VNode) gox.VNode {
 		helpText = helpText + strings.Repeat(" ", overlayWidth-len(helpText))
 	}
 
-	return <box
-		width={overlayWidth}
-		height={4}
-		direction="column"
-	>
-		<text style={map[string]any{"bold": true, "background": "magenta", "color": "white"}}>{titleDisplay}</text>
-		<text style={inputStyle}>{inputDisplay}</text>
-		<text style={map[string]any{"dim": true}}>{helpText}</text>
-		<text>{""}</text>
-	</box>
+	return gox.Element("box", gox.Props{"width": overlayWidth, "height": 4, "direction": "column"},
+		gox.Element("text", gox.Props{"style": map[string]any{"bold": true, "background": "magenta", "color": "white"}},
+			gox.V(titleDisplay)),
+		gox.Element("text", gox.Props{"style": inputStyle},
+			gox.V(inputDisplay)),
+		gox.Element("text", gox.Props{"style": map[string]any{"dim": true}},
+			gox.V(helpText)),
+		gox.Element("text", nil,
+			gox.V("")))
 }
 
 // AppProps defines props for App component
@@ -1738,18 +1750,16 @@ func App(props AppProps, children ...gox.VNode) gox.VNode {
 	// Render overlay IN PLACE of TitleBar when active (more reliable than absolute positioning)
 	var header gox.VNode
 	if s.Overlay != OverlayNone {
-		header = <Overlay Width={width} />
+		header = Overlay(OverlayProps{Width: width})
 	} else {
-		header = <TitleBar Width={width} />
+		header = TitleBar(TitleBarProps{Width: width})
 	}
 
-	return <box direction="column" width={width} height={height}>
-		{header}
-		<Content Height={contentHeight} />
-		<box position="absolute" x={0} y={height - 1} width={width}>
-			<StatusBar />
-		</box>
-	</box>
+	return gox.Element("box", gox.Props{"direction": "column", "width": width, "height": height},
+		gox.V(header),
+		Content(ContentProps{Height: contentHeight}),
+		gox.Element("box", gox.Props{"position": "absolute", "x": 0, "y": height - 1, "width": width},
+			StatusBar(StatusBarProps{})))
 }
 
 func runInteractive(initialURL string) {
@@ -2138,7 +2148,7 @@ func runInteractive(initialURL string) {
 	startSpinner()
 
 	goli.Run(func() gox.VNode {
-		return <App />
+		return App(AppProps{})
 	}, goli.RunOptions{
 		OnMount: func(a *goli.App) {
 			app = a
